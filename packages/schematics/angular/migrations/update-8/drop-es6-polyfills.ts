@@ -6,7 +6,8 @@
  * found in the LICENSE file at https://angular.io/license
  */
 
-import { Rule, Tree } from '@angular-devkit/schematics';
+import { JsonParseMode, isJsonObject, join, normalize, parseJson } from '@angular-devkit/core';
+import { Rule, Tree, chain, noop } from '@angular-devkit/schematics';
 import * as ts from '../../third_party/github.com/Microsoft/TypeScript/lib/typescript';
 
 const toDrop: {[importName: string]: true} = {
@@ -37,24 +38,27 @@ const header = `/**
 
 const applicationPolyfillsHeader = 'APPLICATION IMPORTS';
 
-export const dropES2015Polyfills = (): Rule => {
+function dropES2015PolyfillsFromFile(polyfillPath: string): Rule {
   return (tree: Tree) => {
-    const path = '/polyfills.ts';
-    const source = tree.read(path);
+    const source = tree.read(polyfillPath);
     if (!source) {
-      return;
+      return noop();
     }
 
     // Start the update of the file.
-    const recorder = tree.beginUpdate(path);
+    const recorder = tree.beginUpdate(polyfillPath);
 
-    const sourceFile = ts.createSourceFile(path, source.toString(), ts.ScriptTarget.Latest, true);
+    const sourceFile = ts.createSourceFile(polyfillPath,
+      source.toString(),
+      ts.ScriptTarget.Latest,
+      true,
+    );
     const imports = sourceFile.statements
-        .filter(s => s.kind === ts.SyntaxKind.ImportDeclaration) as ts.ImportDeclaration[];
+      .filter(s => s.kind === ts.SyntaxKind.ImportDeclaration) as ts.ImportDeclaration[];
 
     const applicationPolyfillsStart = sourceFile.getText().indexOf(applicationPolyfillsHeader);
 
-    if (imports.length === 0) { return; }
+    if (imports.length === 0) { return noop(); }
 
     for (const i of imports) {
       const module = ts.isStringLiteral(i.moduleSpecifier) && i.moduleSpecifier.text;
@@ -73,4 +77,43 @@ export const dropES2015Polyfills = (): Rule => {
 
     tree.commitUpdate(recorder);
   };
-};
+}
+
+/**
+ * Move the import reflect metadata polyfill from the polyfill file to the dev environment. This is
+ * not guaranteed to work, but if it doesn't it will result in no changes made.
+ */
+export function dropES2015Polyfills(): Rule {
+  return (tree) => {
+    // Simple. Take the ast of polyfills (if it exists) and find the import metadata. Remove it.
+    const angularConfigContent = tree.read('angular.json') || tree.read('.angular.json');
+    const rules: Rule[] = [];
+
+    if (!angularConfigContent) {
+      // Is this even an angular project?
+      return;
+    }
+
+    const angularJson = parseJson(angularConfigContent.toString(), JsonParseMode.Loose);
+
+    if (!isJsonObject(angularJson) || !isJsonObject(angularJson.projects)) {
+      // If that field isn't there, no use...
+      return;
+    }
+
+    // For all projects
+    for (const projectName of Object.keys(angularJson.projects)) {
+      const project = angularJson.projects[projectName];
+      if (!isJsonObject(project)) {
+        continue;
+      }
+      if (typeof project.sourceRoot != 'string' || project.projectType !== 'application') {
+        continue;
+      }
+
+      rules.push(dropES2015PolyfillsFromFile(join(normalize(project.sourceRoot), '/polyfills.ts')));
+    }
+
+    return chain(rules);
+  };
+}
